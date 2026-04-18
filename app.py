@@ -16,12 +16,14 @@ import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 
 from fastapi import FastAPI, Request, HTTPException, Form, Query
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+
 from aiogram import Bot, Dispatcher, types
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import (
+    Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
@@ -29,6 +31,7 @@ from aiogram.types import (
     BufferedInputFile,
 )
 from aiogram.client.default import DefaultBotProperties
+
 from dotenv import load_dotenv
 import uvicorn
 
@@ -111,18 +114,34 @@ WEB_BASE_URL = (
 TRONGRID_API_KEY = os.getenv("TRONGRID_API_KEY", "").strip()
 TRONGRID_API_URL = "https://api.trongrid.io"
 
-PAYMENT_ADDRESS = os.getenv("PAYMENT_ADDRESS", "TSPpLmYuFXLi6GU1W4uyG6NKGbdWPw886U").strip()
-PAYMENT_SUPPORT = os.getenv("PAYMENT_SUPPORT", "/ZZB339").strip()
+PAYMENT_ADDRESS = os.getenv(
+    "PAYMENT_ADDRESS",
+    "TSPpLmYuFXLi6GU1W4uyG6NKGbdWPw886U"
+).strip()
+
+PAYMENT_SUPPORT = os.getenv(
+    "PAYMENT_SUPPORT",
+    "/ZZB339"
+).strip()
 
 AUTO_PAY_INTERVAL = int(os.getenv("AUTO_PAY_INTERVAL", "15"))
 AUTO_PAY_TX_LIMIT = int(os.getenv("AUTO_PAY_TX_LIMIT", "20"))
 AUTO_PAY_TOLERANCE = float(os.getenv("AUTO_PAY_TOLERANCE", "0.0001"))
 
 WELCOME_ENABLED = os.getenv("WELCOME_ENABLED", "1").strip() == "1"
-WELCOME_TEXT = os.getenv("WELCOME_TEXT", "欢迎 {name} 加入本群。").strip()
+WELCOME_TEXT = os.getenv(
+    "WELCOME_TEXT",
+    "🎉 欢迎 {name} 加入本群！愿你今天好运满满，财源广进！🥳"
+).strip()
+
+BOT_JOIN_ENABLED = os.getenv("BOT_JOIN_ENABLED", "1").strip() == "1"
+BOT_JOIN_TEXT = os.getenv(
+    "BOT_JOIN_TEXT",
+    "🤖 感谢邀请我加入群组！\n请输入【开始】开启记账功能。"
+).strip()
 
 ENV_MODE = os.getenv("ENV", "dev").lower()
-IS_PRODUCTION = ENV_MODE == "prod"
+IS_PRODUCTION = ENV_MODE in ("prod", "production")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing in environment variables")
@@ -132,75 +151,140 @@ if not WEB_TOKEN:
 
 # ================= GLOBALS =================
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+
 USDT_TRC20_CONTRACT = "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"
-TRON_ADDR_RE = re.compile(r"\bT[1-9A-HJ-NP-Za-km-z]{33}\b")
+
+TRON_ADDR_RE = re.compile(
+    r"\bT[1-9A-HJ-NP-Za-km-z]{33}\b"
+)
 
 BOT_USERNAME = None
 HTTP_SESSION = None
 
-RATE_CACHE = {"value": None, "ts": 0}
+RATE_CACHE = {
+    "value": None,
+    "ts": 0,
+}
+
 RATE_CACHE_TTL = 30
 USDT_DAILY_UPDATE_KEY = "usdt_daily_update_date"
+
 
 # ================= BOT =================
 bot = Bot(
     token=BOT_TOKEN,
-    default=DefaultBotProperties(link_preview_is_disabled=True),
+    default=DefaultBotProperties(
+        parse_mode="HTML",
+        link_preview_is_disabled=True,
+    ),
 )
-dp = Dispatcher(storage=MemoryStorage())
-BOT_USERNAME = None
 
-HTTP_SESSION = None  # dùng chung cho aiohttp
+dp = Dispatcher(storage=MemoryStorage())
+
+
+# ================= HTTP SESSION =================
+async def get_http_session():
+    global HTTP_SESSION
+
+    if HTTP_SESSION is None or HTTP_SESSION.closed:
+        timeout = aiohttp.ClientTimeout(
+            total=20,
+            connect=10,
+            sock_read=20,
+        )
+
+        HTTP_SESSION = aiohttp.ClientSession(
+            timeout=timeout
+        )
+
+    return HTTP_SESSION
+
+
+async def close_http_session():
+    global HTTP_SESSION
+
+    if HTTP_SESSION and not HTTP_SESSION.closed:
+        await HTTP_SESSION.close()
+
+    HTTP_SESSION = None
+
 
 # ================= BACKGROUND TASKS =================
 async def daily_usdt_update_loop():
     while True:
         try:
-            # placeholder, để sau nâng cấp thêm nếu cần
             await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             print("daily_usdt_update_loop error:", e)
             await asyncio.sleep(60)
+
 
 async def expiry_warning_loop():
     while True:
         try:
             now_ts = int(time.time())
-            rows = get_expired_access_users(now_ts)
+            rows = get_expired_access_users(now_ts) or []
 
-            for user_id, username, expires_at in rows:
+            for row in rows:
+                try:
+                    user_id, username, expires_at = row
+                except Exception:
+                    print("expiry_warning_loop bad row:", row)
+                    continue
+
                 notice_key = f"expired:{expires_at}"
+
                 if has_expiry_notice(user_id, notice_key):
                     continue
 
                 try:
                     await bot.send_message(
-                        user_id,
-                        "⛔ 您的使用权限已到期。\n如需继续使用，请联系管理员或自助续费。"
+                        chat_id=user_id,
+                        text="⛔ 您的使用权限已到期。\n如需继续使用，请联系管理员或自助续费。"
                     )
                 except Exception as e:
                     print("expiry notify error:", e)
 
-                add_expiry_notice(user_id, notice_key)
+                try:
+                    add_expiry_notice(user_id, notice_key)
+                except Exception as e:
+                    print("add_expiry_notice error:", e)
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             print("expiry_warning_loop error:", e)
 
         await asyncio.sleep(300)
 
+
 async def activate_rental_order(order_code, granted_by=None):
     try:
-        return approve_rental_order(order_code, granted_by=granted_by)
+        return approve_rental_order(
+            order_code,
+            granted_by=granted_by
+        )
     except Exception as e:
         print("activate_rental_order error:", e)
         return None, None, str(e)
 
+
 async def get_usdt_in_transactions(address, limit=AUTO_PAY_TX_LIMIT):
     data = await trongrid_get(
         f"/v1/accounts/{address}/transactions/trc20",
-        params={"limit": limit, "only_confirmed": "true"},
+        params={
+            "limit": limit,
+            "only_confirmed": "true",
+        },
     )
-    return data.get("data", []) if data else []
+
+    if not data:
+        return []
+
+    return data.get("data", []) or []
+
 
 def parse_usdt_tx(tx):
     try:
@@ -212,35 +296,66 @@ def parse_usdt_tx(tx):
     except Exception:
         return None
 
+
 async def auto_check_payments():
     while True:
         try:
-            orders = get_pending_rental_orders(limit=100)
+            orders = get_pending_rental_orders(limit=100) or []
             txs = await get_usdt_in_transactions(PAYMENT_ADDRESS)
-            parsed = [p for p in (parse_usdt_tx(tx) for tx in txs) if p]
+
+            parsed = [
+                p for p in
+                (parse_usdt_tx(tx) for tx in txs)
+                if p
+            ]
 
             used_txids = set()
 
-            for order_code, user_id, username, full_name, category_title, plan_label, amount, created_at in orders:
-                amount = float(amount)
+            for (
+                order_code,
+                user_id,
+                username,
+                full_name,
+                category_title,
+                plan_label,
+                amount,
+                created_at
+            ) in orders:
+                try:
+                    amount = float(amount)
+                except Exception:
+                    print("AUTO PAY invalid amount:", order_code, amount)
+                    continue
 
                 for tx in parsed:
                     txid = tx.get("txid")
+
                     if not txid or txid in used_txids:
                         continue
 
+                    tx_to = str(tx.get("to", "")).strip()
+                    pay_to = str(PAYMENT_ADDRESS).strip()
+
+                    try:
+                        tx_amount = float(tx.get("amount", 0))
+                    except Exception:
+                        continue
+
                     if (
-                        tx.get("to") == PAYMENT_ADDRESS
-                        and abs(float(tx.get("amount", 0)) - amount) < AUTO_PAY_TOLERANCE
+                        tx_to == pay_to
+                        and abs(tx_amount - amount) < AUTO_PAY_TOLERANCE
                     ):
-                        _, new_expires_at, err = await activate_rental_order(order_code)
+                        _, new_expires_at, err = await activate_rental_order(
+                            order_code
+                        )
 
                         if not err:
                             used_txids.add(txid)
+
                             try:
                                 await bot.send_message(
-                                    user_id,
-                                    (
+                                    chat_id=user_id,
+                                    text=(
                                         "✅ 自动到账\n"
                                         f"订单：<code>{order_code}</code>\n"
                                         f"金额：{amount}U\n"
@@ -254,22 +369,25 @@ async def auto_check_payments():
                             print("AUTO PAID:", order_code, txid)
                             break
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             print("AUTO PAY ERROR:", e)
             traceback.print_exc()
 
         await asyncio.sleep(AUTO_PAY_INTERVAL)
-
+        
 # ================= APP LIFESPAN =================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global BOT_USERNAME, HTTP_SESSION
 
-    HTTP_SESSION = aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=15)
-    )
-
     init_db()
+
+    try:
+        await get_http_session()
+    except Exception as e:
+        print("HTTP_SESSION init error:", e)
 
     try:
         me = await bot.get_me()
@@ -319,8 +437,7 @@ async def lifespan(app: FastAPI):
                 print("delete_webhook error:", e)
 
         try:
-            if HTTP_SESSION:
-                await HTTP_SESSION.close()
+            await close_http_session()
         except Exception as e:
             print("HTTP_SESSION close error:", e)
 
@@ -329,6 +446,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print("bot session close error:", e)
 
+
 app = FastAPI(lifespan=lifespan)
 
 # ================= STATES =================
@@ -336,16 +454,20 @@ class BroadcastFSM(StatesGroup):
     waiting_content = State()
     waiting_confirm = State()
 
+
 class TrialFSM(StatesGroup):
     waiting_code = State()
+
 
 class AdminFSM(StatesGroup):
     waiting_add_admin = State()
     waiting_del_admin = State()
     waiting_trial_code = State()
 
+
 class AddressQueryFSM(StatesGroup):
     waiting_address = State()
+
 
 # ================= BASIC HELPERS =================
 def is_cmd(message: types.Message, *cmds):
@@ -355,14 +477,18 @@ def is_cmd(message: types.Message, *cmds):
     head = head.split("@")[0]
     return head in [c.lower() for c in cmds]
 
+
 def is_group_message(message: types.Message):
     return bool(message and message.chat and message.chat.type in ("group", "supergroup"))
+
 
 def is_private(message: types.Message):
     return bool(message and message.chat and message.chat.type == "private")
 
+
 def should_ignore_message(m: types.Message):
     return (not m or not m.from_user or m.from_user.is_bot or not m.text)
+
 
 def fmt_num(x):
     if x is None:
@@ -375,6 +501,7 @@ def fmt_num(x):
     except Exception:
         return str(x)
 
+
 def fmt_ts(ts):
     if not ts:
         return "-"
@@ -386,14 +513,17 @@ def fmt_ts(ts):
     except Exception:
         return "-"
 
+
 def get_chat_setting(chat_id, key, default=None):
     v = get_setting(chat_id, key, None)
     if v is None and chat_id != -1:
         v = get_setting(-1, key, None)
     return v if v is not None else default
 
+
 def set_chat_setting(chat_id, key, value):
     set_setting(chat_id, key, value)
+
 
 def ensure_group(m: types.Message):
     if is_group_message(m):
@@ -406,11 +536,13 @@ def ensure_group(m: types.Message):
                 m.from_user.full_name or "",
             )
 
+
 def get_rate(chat_id):
     try:
         return float(get_chat_setting(chat_id, "rate", "190"))
     except Exception:
         return 190.0
+
 
 def get_fee(chat_id):
     try:
@@ -418,14 +550,18 @@ def get_fee(chat_id):
     except Exception:
         return 7.0
 
+
 def get_enabled(chat_id):
     return str(get_chat_setting(chat_id, "enabled", "1")) == "1"
+
 
 def is_bot_owner(user_id):
     return bool(BOT_OWNER_ID and int(user_id) == int(BOT_OWNER_ID))
 
+
 def is_super_admin(user_id):
     return bool(SUPER_ADMIN_ID and int(user_id) == int(SUPER_ADMIN_ID))
+
 
 def get_user_role(user_id):
     if is_bot_owner(user_id):
@@ -440,35 +576,47 @@ def get_user_role(user_id):
         return "admin"
     return None
 
+
 def can_use_manage_panel(user_id):
     return get_user_role(user_id) in ("owner", "super", "admin")
+
 
 def can_use_bot_ops(user_id):
     return get_user_role(user_id) in ("owner", "super", "admin")
 
+
 def can_manage_codes(user_id):
     return get_user_role(user_id) in ("owner", "super")
+
 
 def can_manage_admins(user_id):
     return get_user_role(user_id) == "owner"
 
+
 def deny_text():
     return "❌ 无权限"
 
+
 def has_bot_access(user_id):
     return get_user_role(user_id) in ("owner", "super", "admin") or has_access_user(user_id)
+
 
 def is_admin_or_operator(chat_id, user: types.User | None):
     if not user:
         return False
     if can_use_bot_ops(user.id):
         return True
-    return is_operator(chat_id, user_id=user.id, username=user.username or "")
+    try:
+        return is_operator(chat_id, user_id=user.id, username=user.username or "")
+    except TypeError:
+        return is_operator(chat_id, user_id=user.id)
+
 
 def is_tron_address(addr: str):
     if not addr:
         return False
-    return bool(re.fullmatch(r"T[1-9A-HJ-NP-Za-km-z]{33}", addr.strip()))
+    return bool(TRON_ADDR_RE.fullmatch(addr.strip()))
+
 
 def extract_tron_address(text: str):
     if not text:
@@ -476,14 +624,15 @@ def extract_tron_address(text: str):
     m = TRON_ADDR_RE.search(text.strip())
     return m.group(0) if m else None
 
+
 async def send_long_text(chat_id, text, reply_markup=None, parse_mode="HTML"):
     text = text or ""
     max_len = 3500
 
     if len(text) <= max_len:
         return await bot.send_message(
-            chat_id,
-            text,
+            chat_id=chat_id,
+            text=text,
             reply_markup=reply_markup,
             parse_mode=parse_mode,
         )
@@ -501,19 +650,23 @@ async def send_long_text(chat_id, text, reply_markup=None, parse_mode="HTML"):
     if buf:
         parts.append(buf)
 
+    last_msg = None
     for i, part in enumerate(parts):
-        await bot.send_message(
-            chat_id,
-            part,
+        last_msg = await bot.send_message(
+            chat_id=chat_id,
+            text=part,
             reply_markup=reply_markup if i == len(parts) - 1 else None,
             parse_mode=parse_mode,
         )
+    return last_msg
+
 
 def day_range(ts=None):
     dt = datetime.now(BEIJING_TZ) if ts is None else datetime.fromtimestamp(int(ts), BEIJING_TZ)
     start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1) - timedelta(seconds=1)
     return int(start.timestamp()), int(end.timestamp())
+
 
 def month_range(offset_months=0):
     now = datetime.now(BEIJING_TZ)
@@ -532,6 +685,7 @@ def month_range(offset_months=0):
 
     end = nxt - timedelta(seconds=1)
     return int(start.timestamp()), int(end.timestamp())
+
 
 def build_vip_welcome_text(display_name, username="", user_id=None, activator_name=None):
     safe_name = escape(display_name or "User")
@@ -561,6 +715,7 @@ def build_vip_welcome_text(display_name, username="", user_id=None, activator_na
 
     return "\n".join(lines)
 
+
 def build_normal_welcome_text(display_name, username="", user_id=None):
     safe_name = escape(display_name or "User")
     safe_username = f"@{escape(username)}" if username else "未设置"
@@ -582,6 +737,7 @@ def build_normal_welcome_text(display_name, username="", user_id=None):
     ]
 
     return "\n".join(lines)
+
 
 async def get_activator_name(granted_by):
     if not granted_by:
@@ -617,7 +773,7 @@ def parse_amount_expr(expr, chat_id, default_direct_unit=False):
     if not expr:
         return None
 
-    expr = expr.strip().replace(" ", "")
+    expr = str(expr).strip().replace(" ", "")
     if not expr:
         return None
 
@@ -626,8 +782,18 @@ def parse_amount_expr(expr, chat_id, default_direct_unit=False):
     if not body:
         return None
 
-    rate_default = get_rate(chat_id)
-    fee_default = get_fee(chat_id)
+    try:
+        rate_default = float(get_rate(chat_id))
+    except Exception:
+        rate_default = 190.0
+
+    try:
+        fee_default = float(get_fee(chat_id))
+    except Exception:
+        fee_default = 7.0
+
+    if rate_default == 0:
+        rate_default = 190.0
 
     # Ví dụ: 777u
     if body.lower().endswith("u"):
@@ -649,6 +815,7 @@ def parse_amount_expr(expr, chat_id, default_direct_unit=False):
             raw_s, rate_s = body.split("/", 1)
             raw_amount = abs(float(raw_s))
             rate_used = float(rate_s)
+
             if rate_used == 0:
                 return None
 
@@ -703,6 +870,7 @@ def parse_amount_expr(expr, chat_id, default_direct_unit=False):
         "fee_used": fee_default,
     }
 
+
 # ================= UI =================
 def menu_kb(user_id=None):
     keyboard = [
@@ -730,6 +898,7 @@ def menu_kb(user_id=None):
         one_time_keyboard=False,
     )
 
+
 def start_inline_kb(user_id=None):
     if BOT_USERNAME:
         add_url = f"https://t.me/{BOT_USERNAME}?startgroup=add"
@@ -742,6 +911,7 @@ def start_inline_kb(user_id=None):
     ]
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 
 def copy_cmd_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -762,6 +932,7 @@ def copy_cmd_kb():
             InlineKeyboardButton(text="📋 复制：使用说明", copy_text=CopyTextButton(text="使用说明")),
         ],
     ])
+
 
 def begin_copy_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -786,6 +957,7 @@ def begin_copy_kb():
             InlineKeyboardButton(text="📋 撤销", callback_data="copy:撤销"),
         ],
     ])
+
 
 def manage_panel_kb(user_id):
     rows = []
@@ -816,6 +988,7 @@ def manage_panel_kb(user_id):
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+
 def report_kb(chat_id):
     rows = []
 
@@ -827,8 +1000,9 @@ def report_kb(chat_id):
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+
 def history_groups_kb():
-    groups = get_groups()
+    groups = get_groups() or []
     rows = []
 
     if not WEB_BASE_URL:
@@ -836,7 +1010,12 @@ def history_groups_kb():
             [InlineKeyboardButton(text="⚠️ WEB_BASE_URL 未配置", callback_data="noop")]
         ])
 
-    for chat_id, title in groups:
+    for item in groups:
+        try:
+            chat_id, title = item
+        except Exception:
+            continue
+
         today = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
         params = urlencode({"date": today})
         url = f"{WEB_BASE_URL}/group/{chat_id}?{params}"
@@ -846,6 +1025,7 @@ def history_groups_kb():
         rows.append([InlineKeyboardButton(text="暂无群组", callback_data="noop")])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 def order_history_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -857,10 +1037,13 @@ def order_history_kb():
         [InlineKeyboardButton(text="❌ 已拒绝", callback_data="order:history:rejected")],
     ])
 
+
 def address_result_kb(address, page=1):
+    safe_address = str(address).strip()
+    safe_page = max(1, int(page or 1))
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📜 链上交易记录", callback_data=f"addr:tx:{address}:{page}"),
+            InlineKeyboardButton(text="📜 链上交易记录", callback_data=f"addr:tx:{safe_address}:{safe_page}"),
         ],
         [
             InlineKeyboardButton(text="🔄 重新查询", callback_data="addr:again"),
@@ -868,19 +1051,23 @@ def address_result_kb(address, page=1):
         ],
     ])
 
+
 def tx_history_kb(address, page=1):
+    safe_address = str(address).strip()
+    safe_page = max(1, int(page or 1))
+
     buttons = []
-    if page > 1:
+    if safe_page > 1:
         buttons.append(
             InlineKeyboardButton(
                 text="⬅️ 上一页",
-                callback_data=f"addr:tx:{address}:{page-1}"
+                callback_data=f"addr:tx:{safe_address}:{safe_page-1}"
             )
         )
 
     buttons.append(
         InlineKeyboardButton(
-            text=f"📄 第 {page} 页",
+            text=f"📄 第 {safe_page} 页",
             callback_data="noop"
         )
     )
@@ -888,11 +1075,12 @@ def tx_history_kb(address, page=1):
     buttons.append(
         InlineKeyboardButton(
             text="下一页 ➡️",
-            callback_data=f"addr:tx:{address}:{page+1}"
+            callback_data=f"addr:tx:{safe_address}:{safe_page+1}"
         )
     )
 
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
+
 
 # ================= RENT UI =================
 RENT_CATEGORIES = {
@@ -908,12 +1096,14 @@ RENT_PLANS = {
     "1y": {"label": "一年", "amount": 700},
 }
 
+
 def rent_main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🤖 Bot quản trị nhóm", callback_data="rent:group_admin")],
         [InlineKeyboardButton(text="💻 Bot máy tính", callback_data="rent:computer")],
         [InlineKeyboardButton(text="🌐 Bot dịch thuật", callback_data="rent:translator")],
     ])
+
 
 def rent_plan_kb(category_key):
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -923,6 +1113,7 @@ def rent_plan_kb(category_key):
         [InlineKeyboardButton(text="一年 (700U)", callback_data=f"rent:plan:{category_key}:1y")],
         [InlineKeyboardButton(text="⬅️ 返回", callback_data="rent:main")],
     ])
+
 
 def rent_payment_text(category_key, plan_key, order_code):
     cat = RENT_CATEGORIES.get(category_key, {})
@@ -943,17 +1134,20 @@ def rent_payment_text(category_key, plan_key, order_code):
         f"🗣️ 在线客服：<code>{escape(PAYMENT_SUPPORT)}</code>"
     )
 
+
 def rent_payment_kb(amount):
+    safe_amount = fmt_num(amount)
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="📋 复制地址", callback_data=f"copy:{PAYMENT_ADDRESS}"),
-            InlineKeyboardButton(text=f"📋 复制金额 {amount}U", callback_data=f"copy:{amount}"),
+            InlineKeyboardButton(text=f"📋 复制金额 {safe_amount}U", callback_data=f"copy:{safe_amount}"),
         ],
         [
             InlineKeyboardButton(text="⬅️ 返回套餐", callback_data="rent:main"),
             InlineKeyboardButton(text="🔄 重新选择", callback_data="rent:back"),
         ],
     ])
+
 
 # ================= TEXTS =================
 def help_text():
@@ -986,6 +1180,7 @@ def help_text():
         "• 或使用自助续费菜单提交租用订单\n"
     )
 
+
 def begin_help_text():
     return (
         "🔥 <b>开始记账</b>\n\n"
@@ -1003,6 +1198,7 @@ def begin_help_text():
         "• <code>撤销</code>\n"
     )
 
+
 def address_query_text():
     return (
         "🔍 <b>地址查询</b>\n\n"
@@ -1010,6 +1206,7 @@ def address_query_text():
         "<b>示例：</b>\n"
         "<code>TSPpLmYuFXLi6GU1W4uyG6NKGbdWPw886U</code>"
     )
+
 
 def group_feature_text():
     return (
@@ -1021,6 +1218,7 @@ def group_feature_text():
         "• 下发：<code>下发5000</code>\n"
         "• 寄存：<code>P+2000</code>"
     )
+
 
 # ================= REPORT HELPERS =================
 def split_target_prefix(text):
@@ -1034,6 +1232,7 @@ def split_target_prefix(text):
             if target:
                 return target, body
     return None, t
+
 
 def format_tx_line(tx):
     (
@@ -1073,20 +1272,23 @@ def format_tx_line(tx):
 
     return line.strip()
 
-def summarize_transactions(txs):
-    income = [t for t in txs if t[6] == "income"]
-    payout = [t for t in txs if t[6] == "payout"]
-    reserve = [t for t in txs if t[6] == "reserve"]
 
-    total_income_unit = sum((t[8] or 0) for t in income)
-    total_payout_unit = sum((t[8] or 0) for t in payout)
-    total_reserve_unit = sum((t[8] or 0) for t in reserve)
+def summarize_transactions(txs):
+    txs = txs or []
+
+    income = [t for t in txs if len(t) > 6 and t[6] == "income"]
+    payout = [t for t in txs if len(t) > 6 and t[6] == "payout"]
+    reserve = [t for t in txs if len(t) > 6 and t[6] == "reserve"]
+
+    total_income_unit = sum(float(t[8] or 0) for t in income)
+    total_payout_unit = sum(float(t[8] or 0) for t in payout)
+    total_reserve_unit = sum(float(t[8] or 0) for t in reserve)
 
     due = total_income_unit + total_reserve_unit
     paid = total_payout_unit
     pending = due - paid
 
-    total_raw_income = sum((abs(t[7]) or 0) for t in income if t[7] is not None)
+    total_raw_income = sum(float(abs(t[7]) or 0) for t in income if t[7] is not None)
 
     return {
         "income_count": len(income),
@@ -1101,13 +1303,14 @@ def summarize_transactions(txs):
         "total_raw_income": total_raw_income,
     }
 
+
 def report_text(chat_id, start_ts, end_ts, title="账单", user_id=None, display_name=None):
-    txs = get_transactions(chat_id, start_ts=start_ts, end_ts=end_ts, user_id=user_id)
+    txs = get_transactions(chat_id, start_ts=start_ts, end_ts=end_ts, user_id=user_id) or []
     stats = summarize_transactions(txs)
 
-    income_txs = [t for t in txs if t[6] == "income"]
-    payout_txs = [t for t in txs if t[6] == "payout"]
-    reserve_txs = [t for t in txs if t[6] == "reserve"]
+    income_txs = [t for t in txs if len(t) > 6 and t[6] == "income"]
+    payout_txs = [t for t in txs if len(t) > 6 and t[6] == "payout"]
+    reserve_txs = [t for t in txs if len(t) > 6 and t[6] == "reserve"]
 
     lines = [f"📘 <b>{escape(title)}</b>"]
     if display_name:
@@ -1117,7 +1320,10 @@ def report_text(chat_id, start_ts, end_ts, title="账单", user_id=None, display
     lines.append(f"🟢 <b>入款（{len(income_txs)}笔）</b>")
     if income_txs:
         for tx in income_txs:
-            lines.append(format_tx_line(tx))
+            try:
+                lines.append(format_tx_line(tx))
+            except Exception:
+                continue
     else:
         lines.append("暂无入款")
 
@@ -1125,7 +1331,10 @@ def report_text(chat_id, start_ts, end_ts, title="账单", user_id=None, display
     lines.append(f"🔵 <b>下发（{len(payout_txs)}笔）</b>")
     if payout_txs:
         for tx in payout_txs:
-            lines.append(format_tx_line(tx))
+            try:
+                lines.append(format_tx_line(tx))
+            except Exception:
+                continue
     else:
         lines.append("暂无下发")
 
@@ -1133,18 +1342,23 @@ def report_text(chat_id, start_ts, end_ts, title="账单", user_id=None, display
         lines.append("")
         lines.append(f"🟣 <b>寄存（{len(reserve_txs)}笔）</b>")
         for tx in reserve_txs:
-            lines.append(format_tx_line(tx))
+            try:
+                lines.append(format_tx_line(tx))
+            except Exception:
+                continue
 
-    # Thêm lại phần 分组统计
     if user_id is None:
         lines.append("")
         lines.append("📂 <b>分组统计</b>")
         group_map = {}
 
         for tx in income_txs:
-            key = escape(tx[5] or "未命名")
-            group_map.setdefault(key, 0.0)
-            group_map[key] += float(tx[8] or 0)
+            try:
+                key = escape(tx[5] or "未命名")
+                group_map.setdefault(key, 0.0)
+                group_map[key] += float(tx[8] or 0)
+            except Exception:
+                continue
 
         if group_map:
             for k, v in group_map.items():
@@ -1163,7 +1377,6 @@ def report_text(chat_id, start_ts, end_ts, title="账单", user_id=None, display
     lines.append(f"⏳ 未下发：{fmt_num(stats['pending'])}U")
 
     return "\n".join(lines)
-
 # ================= TRON API =================
 async def trongrid_get(path, params=None):
     headers = {
@@ -1173,15 +1386,23 @@ async def trongrid_get(path, params=None):
     if TRONGRID_API_KEY:
         headers["TRON-PRO-API-KEY"] = TRONGRID_API_KEY
 
-    url = path if path.startswith("http") else f"{TRONGRID_API_URL}{path}"
+    url = path if str(path).startswith("http") else f"{TRONGRID_API_URL}{path}"
 
-    if HTTP_SESSION is None:
+    try:
+        session = await get_http_session()
+    except Exception as e:
+        print("trongrid_get session error:", e)
         return {}
 
-    async with HTTP_SESSION.get(url, params=params, headers=headers) as resp:
-        if resp.status != 200:
-            return {}
-        return await resp.json()
+    try:
+        async with session.get(url, params=params, headers=headers) as resp:
+            if resp.status != 200:
+                return {}
+            return await resp.json()
+    except Exception as e:
+        print("trongrid_get error:", e)
+        return {}
+
 
 def _pick_account(payload):
     if not isinstance(payload, dict):
@@ -1193,6 +1414,7 @@ def _pick_account(payload):
     if isinstance(payload.get("data"), dict):
         return payload["data"]
     return None
+
 
 def _parse_trc20_usdt(account):
     if not isinstance(account, dict):
@@ -1260,36 +1482,43 @@ def _parse_trc20_usdt(account):
                         return 0.0
     return None
 
+
 async def check_tron_address(address: str):
-    def _fetch():
-        headers = {
-            "accept": "application/json",
-            "user-agent": "Mozilla/5.0",
-        }
-        if TRONGRID_API_KEY:
-            headers["TRON-PRO-API-KEY"] = TRONGRID_API_KEY
+    headers = {
+        "accept": "application/json",
+        "user-agent": "Mozilla/5.0",
+    }
+    if TRONGRID_API_KEY:
+        headers["TRON-PRO-API-KEY"] = TRONGRID_API_KEY
 
-        sources = [
-            f"https://api.trongrid.io/v1/accounts/{address}",
-            f"https://apilist.tronscanapi.com/api/account?address={address}",
-        ]
+    sources = [
+        ("trongrid", f"https://api.trongrid.io/v1/accounts/{address}"),
+        ("tronscan", f"https://apilist.tronscanapi.com/api/account?address={address}"),
+    ]
 
-        for url in sources:
-            try:
-                r = requests.get(url, timeout=8, headers=headers)
-                if not r.ok:
-                    continue
-                payload = r.json()
-                acc = _pick_account(payload)
-                if acc:
-                    source_name = "trongrid" if "trongrid" in url else "tronscan"
-                    return {"source": source_name, "account": acc}
-            except Exception as e:
-                print("wallet api error:", url, e)
-
+    try:
+        session = await get_http_session()
+    except Exception as e:
+        print("check_tron_address session error:", e)
         return None
 
-    result = await asyncio.to_thread(_fetch)
+    result = None
+
+    for source_name, url in sources:
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8), headers=headers) as resp:
+                if resp.status != 200:
+                    continue
+
+                payload = await resp.json()
+                acc = _pick_account(payload)
+
+                if acc:
+                    result = {"source": source_name, "account": acc}
+                    break
+        except Exception as e:
+            print("wallet api error:", url, e)
+
     if not result:
         return None
 
@@ -1343,6 +1572,16 @@ async def check_tron_address(address: str):
 
 
 async def get_tron_transactions(address, page=1, page_size=10):
+    try:
+        page = max(1, int(page))
+    except Exception:
+        page = 1
+
+    try:
+        page_size = max(1, min(50, int(page_size)))
+    except Exception:
+        page_size = 10
+
     offset = max(0, (page - 1) * page_size)
 
     tx_data = await trongrid_get(
@@ -1411,6 +1650,7 @@ def format_address_info_text(address, info, sender_name=None, user_send_count=No
     ])
 
     return "\n".join(lines)
+
 
 def make_wallet_card_image(
     address,
@@ -1526,7 +1766,8 @@ def make_wallet_card_image(
     img.save(bio, "PNG")
     bio.seek(0)
     return BufferedInputFile(bio.read(), filename="usdt_check_cn.png")
-    
+
+
 # ================= USDT RATE =================
 async def fetch_usdt_rates():
     urls = [
@@ -1534,12 +1775,18 @@ async def fetch_usdt_rates():
         "https://api.exchangerate.host/latest?base=USD&symbols=CNY,VND",
     ]
 
-    if HTTP_SESSION is None:
+    try:
+        session = await get_http_session()
+    except Exception as e:
+        print("fetch_usdt_rates session error:", e)
         return None
 
     for url in urls:
         try:
-            async with HTTP_SESSION.get(url) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    continue
+
                 data = await resp.json()
 
                 if data.get("result") == "success" and "rates" in data:
@@ -1550,14 +1797,16 @@ async def fetch_usdt_rates():
                     }
 
                 rates = data.get("rates", {})
-                return {
-                    "usd_cny": float(rates.get("CNY")) if rates.get("CNY") else None,
-                    "usd_vnd": float(rates.get("VND")) if rates.get("VND") else None,
-                }
+                if rates:
+                    return {
+                        "usd_cny": float(rates.get("CNY")) if rates.get("CNY") else None,
+                        "usd_vnd": float(rates.get("VND")) if rates.get("VND") else None,
+                    }
         except Exception as e:
             print("fetch_usdt_rates error:", e)
 
     return None
+
 
 def format_usdt_rate_text(rates):
     now_str = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -1581,11 +1830,13 @@ def format_usdt_rate_text(rates):
     lines += ["", f"🕒 更新时间：<code>{now_str}</code>"]
     return "\n".join(lines)
 
+
 def rate_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 刷新价格", callback_data="rate:refresh")],
         [InlineKeyboardButton(text="📝 使用说明", callback_data="menu:help")],
     ])
+
 
 async def get_usdt_rates_cached(force=False):
     now = time.time()
@@ -1597,7 +1848,9 @@ async def get_usdt_rates_cached(force=False):
         RATE_CACHE["value"] = rates
         RATE_CACHE["ts"] = now
         return rates
+
     return RATE_CACHE["value"]
+
 
 async def daily_usdt_update_loop():
     while True:
@@ -1620,10 +1873,12 @@ async def daily_usdt_update_loop():
                 await asyncio.sleep(min(sleep_seconds, 60))
             else:
                 await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             print("daily_usdt_update_loop error:", e)
             await asyncio.sleep(60)
-
+            
 # ================= RENEW / EXPIRY =================
 def plan_duration_seconds(plan_key):
     if plan_key == "1m":
@@ -1636,6 +1891,7 @@ def plan_duration_seconds(plan_key):
         return 365 * 24 * 60 * 60
     return 30 * 24 * 60 * 60
 
+
 def calc_renew_expire_at(user_id, plan_key):
     now_ts = int(time.time())
     duration = plan_duration_seconds(plan_key)
@@ -1646,49 +1902,69 @@ def calc_renew_expire_at(user_id, plan_key):
         current_exp = access_row[4]
 
     base_ts = now_ts
-    if current_exp and int(current_exp) > now_ts:
-        base_ts = int(current_exp)
+    try:
+        if current_exp and int(current_exp) > now_ts:
+            base_ts = int(current_exp)
+    except Exception:
+        base_ts = now_ts
 
     return base_ts + duration
+
 
 async def activate_rental_order(order_code, granted_by=None):
     row = get_rental_order(order_code)
     if not row:
         return None, None, "订单不存在"
 
-    (
-        order_code, user_id, username, full_name, category_key, category_title,
-        plan_key, plan_label, amount, status, created_at, paid_at, expires_at, note
-    ) = row
+    try:
+        (
+            order_code, user_id, username, full_name, category_key, category_title,
+            plan_key, plan_label, amount, status, created_at, paid_at, expires_at, note
+        ) = row
+    except Exception:
+        return None, None, "订单数据异常"
 
     if status == "paid":
         return row, expires_at, "订单已支付"
 
     new_expires_at = calc_renew_expire_at(user_id, plan_key)
 
-    mark_rental_order_paid(order_code, expires_at=new_expires_at)
-    add_access_user(
-        user_id=user_id,
-        username=username or "",
-        granted_by=granted_by,
-        expires_at=new_expires_at,
-    )
+    try:
+        mark_rental_order_paid(order_code, expires_at=new_expires_at)
+        add_access_user(
+            user_id=user_id,
+            username=username or "",
+            granted_by=granted_by,
+            expires_at=new_expires_at,
+        )
+    except Exception as e:
+        print("activate_rental_order db error:", e)
+        return None, None, "开通失败"
 
     return row, new_expires_at, None
+
 
 async def expiry_warning_loop():
     while True:
         try:
             now_ts = int(time.time())
-            rows = get_access_users()
+            rows = get_access_users() or []
 
             for row in rows:
-                user_id, username, granted_by, granted_at, expires_at = row
+                try:
+                    user_id, username, granted_by, granted_at, expires_at = row
+                except Exception:
+                    print("expiry_warning_loop bad row:", row)
+                    continue
 
                 if not expires_at:
                     continue
 
-                expires_at = int(expires_at)
+                try:
+                    expires_at = int(expires_at)
+                except Exception:
+                    continue
+
                 remain = expires_at - now_ts
 
                 if remain <= 0:
@@ -1697,8 +1973,8 @@ async def expiry_warning_loop():
                         add_expiry_notice(user_id, notice_key)
                         try:
                             await bot.send_message(
-                                user_id,
-                                "⏳ 您的使用权限已到期，请尽快续费。",
+                                chat_id=user_id,
+                                text="⏳ 您的使用权限已到期，请尽快续费。",
                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                                     [InlineKeyboardButton(text="🔑 立即续费", callback_data="rent:main")]
                                 ]),
@@ -1720,10 +1996,13 @@ async def expiry_warning_loop():
                         if not has_expiry_notice(user_id, notice_key):
                             add_expiry_notice(user_id, notice_key)
                             try:
-                                expire_str = datetime.fromtimestamp(expires_at, BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+                                expire_str = datetime.fromtimestamp(
+                                    expires_at, BEIJING_TZ
+                                ).strftime("%Y-%m-%d %H:%M:%S")
+
                                 await bot.send_message(
-                                    user_id,
-                                    (
+                                    chat_id=user_id,
+                                    text=(
                                         f"⚠️ 您的权限将在 <b>{label}</b> 后到期。\n\n"
                                         f"到期时间：<code>{expire_str}</code>\n"
                                         "请及时续费。"
@@ -1737,37 +2016,52 @@ async def expiry_warning_loop():
                                 print("warn notify failed:", e)
                         break
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             print("expiry_warning_loop error:", e)
 
         await asyncio.sleep(300)
+
 
 # ================= COMMON CALLBACKS =================
 @dp.callback_query(lambda c: c.data == "noop")
 async def noop_cb(c: types.CallbackQuery):
     await c.answer()
 
+
 @dp.callback_query(lambda c: c.data and c.data.startswith("copy:"))
 async def copy_cb(c: types.CallbackQuery):
+    await c.answer("已发送可复制文本")
     if not c.message:
-        return await c.answer()
+        return
 
     text = c.data.split(":", 1)[1]
-    await c.message.answer(f"📋 请复制：\n<code>{text}</code>", parse_mode="HTML")
-    await c.answer("已发送可复制文本")
+    await c.message.answer(
+        f"📋 请复制：\n<code>{escape(text)}</code>",
+        parse_mode="HTML"
+    )
+
 
 @dp.callback_query(lambda c: c.data == "menu:help")
 async def menu_help_cb(c: types.CallbackQuery):
+    await c.answer()
     if not c.message:
         return
-    await c.message.answer(help_text(), parse_mode="HTML", reply_markup=menu_kb(c.from_user.id if c.from_user else None))
-    await c.answer()
+    await c.message.answer(
+        help_text(),
+        parse_mode="HTML",
+        reply_markup=menu_kb(c.from_user.id if c.from_user else None)
+    )
+
 
 @dp.callback_query(lambda c: c.data == "menu:copy")
 async def menu_copy_cb(c: types.CallbackQuery):
+    await c.answer()
     if not c.message:
         return
-    await c.answer()
+    await c.message.answer("📋 常用命令复制区：", reply_markup=copy_cmd_kb())
+
 
 # ================= START / PRIVATE MENU =================
 @dp.message(lambda m: is_private(m) and m.text and is_cmd(m, "/start"))
@@ -1801,22 +2095,26 @@ async def start_cmd(m: types.Message):
     await m.answer("📋 常用命令复制区：", reply_markup=copy_cmd_kb())
     await m.answer("👇 你也可以从这里开始：", reply_markup=start_inline_kb(m.from_user.id))
 
-    
+
 @dp.message(lambda m: is_private(m) and m.text in ("🔥 开始记账", "开始记账", "开始"))
 async def menu_begin(m: types.Message):
-   await m.answer(begin_help_text(), parse_mode="HTML")
+    await m.answer(begin_help_text(), parse_mode="HTML")
+
 
 @dp.message(lambda m: is_private(m) and ((m.text in ("📝 使用说明", "使用说明")) or is_cmd(m, "/help")))
 async def menu_help(m: types.Message):
     await m.reply(help_text(), reply_markup=menu_kb(m.from_user.id), parse_mode="HTML")
 
+
 @dp.message(lambda m: is_private(m) and m.text in ("📋 复制命令", "复制命令"))
 async def menu_copy(m: types.Message):
     await m.reply("📋 常用命令复制区：", reply_markup=copy_cmd_kb())
 
+
 @dp.message(lambda m: is_private(m) and m.text in ("👥 分组功能", "分组功能"))
 async def group_feature_menu(m: types.Message):
     await m.answer(group_feature_text(), parse_mode="HTML")
+
 
 # ================= TRIAL / ACCESS =================
 @dp.message(lambda m: is_private(m) and m.text in ("💎 申请试用", "申请试用"))
@@ -1847,6 +2145,7 @@ async def menu_trial(m: types.Message, state: FSMContext):
         "请输入管理员发送的续费码继续使用。"
     )
 
+
 @dp.message(TrialFSM.waiting_code)
 async def receive_trial_redeem_code(m: types.Message, state: FSMContext):
     if not m.text:
@@ -1871,6 +2170,7 @@ async def receive_trial_redeem_code(m: types.Message, state: FSMContext):
     await state.clear()
     await m.reply("✅ 续费成功，您已获得长期使用权限。")
 
+
 # ================= GROUP CONTROL =================
 @dp.message(lambda m: is_group_message(m) and (m.text in ("开始", "开始记账", "开启记账", "🔥 开始记账")))
 async def start_accounting(m: types.Message):
@@ -1881,6 +2181,7 @@ async def start_accounting(m: types.Message):
     set_chat_setting(m.chat.id, "enabled", "1")
     await m.reply("✅ 记账已开启！")
 
+
 @dp.message(lambda m: is_group_message(m) and m.text in ("关闭记账", "停止记账"))
 async def stop_accounting(m: types.Message):
     ensure_group(m)
@@ -1889,6 +2190,7 @@ async def stop_accounting(m: types.Message):
 
     set_chat_setting(m.chat.id, "enabled", "0")
     await m.reply("⛔ 记账已关闭！")
+
 
 @dp.message(lambda m: is_group_message(m) and m.text in ("上课", "下课"))
 async def group_permission_cmd(m: types.Message):
@@ -1913,6 +2215,7 @@ async def group_permission_cmd(m: types.Message):
         await m.reply("❌ 机器人没有权限修改群权限")
         print("group_permission_cmd error:", e)
 
+
 @dp.message(lambda m: is_group_message(m) and bool(re.match(r"^设置汇率\s*-?\d+(\.\d+)?$", (m.text or "").strip())))
 async def set_rate_cmd(m: types.Message):
     ensure_group(m)
@@ -1925,6 +2228,7 @@ async def set_rate_cmd(m: types.Message):
     set_chat_setting(m.chat.id, "rate", num[0])
     await m.reply(f"✅ 汇率已设置为 {num[0]}")
 
+
 @dp.message(lambda m: is_group_message(m) and bool(re.match(r"^设置费率\s*-?\d+(\.\d+)?$", (m.text or "").strip())))
 async def set_fee_cmd(m: types.Message):
     ensure_group(m)
@@ -1936,6 +2240,7 @@ async def set_fee_cmd(m: types.Message):
         return await m.reply("❌ 格式错误")
     set_chat_setting(m.chat.id, "fee", num[0])
     await m.reply(f"✅ 费率已设置为 {num[0]}%")
+
 
 @dp.message(lambda m: is_group_message(m) and m.text in ("总账单", "今日总账单"))
 async def day_report_cmd(m: types.Message):
@@ -1950,6 +2255,7 @@ async def day_report_cmd(m: types.Message):
         reply_markup=report_kb(m.chat.id),
     )
 
+
 @dp.message(lambda m: is_group_message(m) and m.text in ("上个月总账单",))
 async def prev_month_report_cmd(m: types.Message):
     ensure_group(m)
@@ -1962,6 +2268,7 @@ async def prev_month_report_cmd(m: types.Message):
         report_text(m.chat.id, start_ts, end_ts, title="上个月账单"),
         reply_markup=report_kb(m.chat.id),
     )
+
 
 @dp.message(lambda m: is_group_message(m) and (m.text in ("账单",) or is_cmd(m, "/我")))
 async def user_report_cmd(m: types.Message):
@@ -1985,6 +2292,7 @@ async def user_report_cmd(m: types.Message):
     )
     await send_long_text(m.chat.id, text, reply_markup=report_kb(m.chat.id))
 
+
 @dp.message(lambda m: is_group_message(m) and m.text == "撤销")
 async def undo_cmd(m: types.Message):
     ensure_group(m)
@@ -2003,6 +2311,7 @@ async def undo_cmd(m: types.Message):
         reply_markup=report_kb(m.chat.id),
     )
 
+
 # ================= REALTIME RATE =================
 @dp.message(lambda m: m.text in ("实时U价", "📈 实时U价"))
 async def menu_rate(m: types.Message):
@@ -2012,13 +2321,15 @@ async def menu_rate(m: types.Message):
     rates = await get_usdt_rates_cached()
     await m.answer(format_usdt_rate_text(rates), reply_markup=rate_kb(), parse_mode="HTML")
 
+
 @dp.callback_query(lambda c: c.data == "rate:refresh")
 async def rate_refresh_cb(c: types.CallbackQuery):
+    await c.answer("✅ 已刷新")
     if not c.message:
         return
     rates = await get_usdt_rates_cached(force=True)
     await c.message.answer(format_usdt_rate_text(rates), reply_markup=rate_kb(), parse_mode="HTML")
-    await c.answer("✅ 已刷新")
+
 
 # ================= ADDRESS QUERY =================
 @dp.message(lambda m: is_private(m) and m.text in ("地址查询", "🔍 地址查询", "📍 地址查询"))
@@ -2027,6 +2338,7 @@ async def menu_address_query(m: types.Message, state: FSMContext):
         return await m.reply("❌ 无权限")
     await state.set_state(AddressQueryFSM.waiting_address)
     await m.reply(address_query_text(), parse_mode="HTML")
+
 
 @dp.message(AddressQueryFSM.waiting_address)
 async def receive_address_query(m: types.Message, state: FSMContext):
@@ -2041,61 +2353,97 @@ async def receive_address_query(m: types.Message, state: FSMContext):
             parse_mode="HTML",
         )
 
-    await m.reply("⏳ 正在查询链上数据，请稍候...")
+    wait_msg = await m.reply("⏳ 正在查询链上数据，请稍候...")
 
     try:
         info = await check_tron_address(addr)
         text = format_address_info_text(addr, info)
     except Exception as e:
         print("on-chain query error:", e)
-        text = f"🔎 查询地址：<code>{addr}</code>\n\n⚠️ 查询失败，请稍后再试。"
+        text = f"🔎 查询地址：<code>{escape(addr)}</code>\n\n⚠️ 查询失败，请稍后再试。"
 
     await state.clear()
-    await m.reply(text, parse_mode="HTML", reply_markup=address_result_kb(addr, page=1))
+
+    try:
+        await wait_msg.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=address_result_kb(addr, page=1)
+        )
+    except Exception:
+        await m.reply(text, parse_mode="HTML", reply_markup=address_result_kb(addr, page=1))
+
 
 @dp.callback_query(lambda c: c.data == "addr:again")
 async def addr_again_cb(c: types.CallbackQuery, state: FSMContext):
+    await c.answer()
     if not c.message:
         return
     await state.set_state(AddressQueryFSM.waiting_address)
     await c.message.answer(address_query_text(), parse_mode="HTML")
-    await c.answer()
+
 
 @dp.callback_query(lambda c: c.data == "addr:back")
 async def addr_back_cb(c: types.CallbackQuery, state: FSMContext):
+    await c.answer()
     if not c.message:
         return
     await state.clear()
     await c.message.answer("✅ 已返回主菜单")
-    await c.answer()
+
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("addr:tx:"))
 async def addr_tx_cb(c: types.CallbackQuery):
+    await c.answer()
     if not c.message:
         return
 
     parts = c.data.split(":")
-    address = parts[2]
-    page = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else 1
+    if len(parts) < 4:
+        return await c.message.answer("⚠️ 参数错误")
 
-    await c.message.answer("⏳ 正在加载交易记录，请稍候...")
+    address = parts[2]
+    page = int(parts[3]) if parts[3].isdigit() else 1
+
+    wait_msg = await c.message.answer("⏳ 正在加载交易记录，请稍候...")
 
     try:
         txs = await get_tron_transactions(address, page=page, page_size=10)
         if not txs:
-            await c.message.answer(f"🔎 查询地址：<code>{address}</code>\n📄 当前页无交易记录", parse_mode="HTML")
-            return await c.answer()
-    
-        text = f"🔎 查询地址：<code>{address}</code>\n🗂 当前页码：第 {page} 页\n\n📄 交易记录：\n"
+            try:
+                await wait_msg.edit_text(
+                    f"🔎 查询地址：<code>{escape(address)}</code>\n📄 当前页无交易记录",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                await c.message.answer(
+                    f"🔎 查询地址：<code>{escape(address)}</code>\n📄 当前页无交易记录",
+                    parse_mode="HTML"
+                )
+            return
+
+        text = f"🔎 查询地址：<code>{escape(address)}</code>\n🗂 当前页码：第 {page} 页\n\n📄 交易记录：\n"
         for tx in txs:
             text += format_tron_tx_row(tx) + "\n\n"
 
-        await c.message.answer(text, parse_mode="HTML", reply_markup=tx_history_kb(address, page))
+        try:
+            await wait_msg.edit_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=tx_history_kb(address, page)
+            )
+        except Exception:
+            await c.message.answer(
+                text,
+                parse_mode="HTML",
+                reply_markup=tx_history_kb(address, page)
+            )
     except Exception as e:
         print("addr tx cb error:", e)
-        await c.message.answer("⚠️ 交易记录加载失败，请稍后再试。")
-
-    await c.answer()
+        try:
+            await wait_msg.edit_text("⚠️ 交易记录加载失败，请稍后再试。")
+        except Exception:
+            await c.message.answer("⚠️ 交易记录加载失败，请稍后再试。")
 
 # ================= WALLET UI =================
 def address_result_kb(address, page=1):
@@ -2622,169 +2970,6 @@ def make_wallet_card_image(
     bio.seek(0)
     return BufferedInputFile(bio.read(), filename="usdt_check_cn.png")
 
-# ================= ADDRESS QUERY =================
-@dp.message(lambda m: is_private(m) and m.text in ("地址查询", "🔍 地址查询", "📍 地址查询"))
-async def menu_address_query(m: types.Message, state: FSMContext):
-    if not m.from_user:
-        return
-
-    if not can_use_bot_ops(m.from_user.id) and not has_bot_access(m.from_user.id):
-        return await m.reply("❌ 无权限")
-
-    await state.set_state(AddressQueryFSM.waiting_address)
-    await m.reply(
-        "🔍 <b>地址查询</b>\n\n请直接发送 TRON 地址进行查询。\n\n示例：\n<code>TSPpLmYuFXLi6GU1W4uyG6NKGbdWPw886U</code>",
-        parse_mode="HTML",
-    )
-
-@dp.message(AddressQueryFSM.waiting_address)
-async def receive_address_query(m: types.Message, state: FSMContext):
-    if not m.from_user:
-        return
-
-    if not can_use_bot_ops(m.from_user.id) and not has_bot_access(m.from_user.id):
-        return await m.reply("❌ 无权限")
-
-    addr = (m.text or "").strip()
-    if not is_tron_address(addr):
-        return await m.reply(
-            "❌ 地址格式不正确，请重新输入 TRON 地址。\n示例：<code>TSPpLmYuFXLi6GU1W4uyG6NKGbdWPw886U</code>",
-            parse_mode="HTML",
-        )
-
-    wait_msg = await m.reply("⏳ 正在查询链上数据，请稍候...")
-
-    try:
-        info = await check_tron_address(addr)
-        sender_name = m.from_user.full_name or (m.from_user.username or str(m.from_user.id))
-
-        try:
-            add_wallet_check(
-                chat_id=m.chat.id,
-                user_id=m.from_user.id,
-                username=m.from_user.username or "",
-                full_name=m.from_user.full_name or "",
-                address=addr,
-                trx_balance=info.get("trx_balance") if info else None,
-                usdt_balance=info.get("usdt_balance") if info else None,
-                tx_count=info.get("tx_count") if info else None,
-            )
-        except Exception as e:
-            print("private add_wallet_check error:", e)
-
-        user_send_count = get_user_wallet_send_count(m.from_user.id, None)
-
-        text_html = format_address_info_text(
-            addr,
-            info,
-            sender_name=sender_name,
-            user_send_count=user_send_count,
-        )
-
-        if info:
-            text_html += build_wallet_warning_html(info)
-
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔗 Tronscan", url=f"https://tronscan.org/#/address/{addr}")],
-            [InlineKeyboardButton(text="📄 最近链上交易", callback_data=f"addr:tx:{addr}:1")],
-            [InlineKeyboardButton(text="🔄 重新查询", callback_data="addr:again")],
-            [InlineKeyboardButton(text="⬅️ 返回菜单", callback_data="addr:back")],
-        ])
-
-        try:
-            photo = make_wallet_card_image(
-                address=addr,
-                sender_name=sender_name,
-                user_send_count=user_send_count,
-                trx_balance=info.get("trx_balance") if info else None,
-                usdt_balance=info.get("usdt_balance") if info else None,
-                tx_count=info.get("tx_count") if info else None,
-                source=info.get("source") if info else "unknown",
-                create_time=info.get("create_time") if info else None,
-                latest_time=info.get("latest_time") if info else None,
-            )
-            await m.answer_photo(photo=photo, caption=text_html, reply_markup=kb, parse_mode="HTML")
-        except Exception as e:
-            print("private send wallet photo error:", e)
-            await m.reply(text_html, parse_mode="HTML", reply_markup=kb)
-
-    except Exception as e:
-        print("on-chain query error:", e)
-        await m.reply(
-            f"🔎 查询地址：<code>{escape(addr)}</code>\n\n⚠️ 查询失败，请稍后再试。",
-            parse_mode="HTML",
-        )
-
-    await state.clear()
-
-    try:
-        await wait_msg.delete()
-    except Exception:
-        pass
-
-
-@dp.callback_query(lambda c: c.data == "addr:again")
-async def addr_again_cb(c: types.CallbackQuery, state: FSMContext):
-    if not c.message:
-        return
-    await state.set_state(AddressQueryFSM.waiting_address)
-    await c.message.answer("请重新发送 TRON 地址。")
-    await c.answer()
-
-@dp.callback_query(lambda c: c.data == "addr:back")
-async def addr_back_cb(c: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    if c.message:
-        await c.message.answer("✅ 已返回主菜单")
-    await c.answer()
-
-@dp.callback_query(lambda c: c.data and c.data.startswith("addr:tx:"))
-async def addr_tx_cb(c: types.CallbackQuery):
-    if not c.message or not c.data:
-        return
-
-    parts = c.data.split(":")
-    if len(parts) < 4:
-        return await c.answer("数据错误", show_alert=True)
-
-    address = parts[2].strip()
-    if not is_tron_address(address):
-        return await c.answer("地址错误", show_alert=True)
-
-    try:
-        page = int(parts[3])
-        if page < 1:
-            page = 1
-    except Exception:
-        page = 1
-
-    await c.message.answer("⏳ 正在加载交易记录，请稍候...")
-
-    try:
-        txs = await get_tron_transactions(address, page=page, page_size=10)
-        if not txs:
-            await c.message.answer(
-                f"🔎 查询地址：<code>{escape(address)}</code>\n📄 当前页无交易记录",
-                parse_mode="HTML"
-            )
-            return await c.answer()
-
-        text = f"🔎 查询地址：<code>{escape(address)}</code>\n🗂 当前页码：第 {page} 页\n\n📄 交易记录：\n"
-        for tx in txs:
-            text += format_tron_tx_row(tx) + "\n\n"
-
-        await c.message.answer(
-            text,
-            parse_mode="HTML",
-            reply_markup=tx_history_kb(address, page)
-        )
-    except Exception as e:
-        print("addr tx cb error:", e)
-        await c.message.answer("⚠️ 交易记录加载失败，请稍后再试。")
-
-    await c.answer()
-
-
 # ================= WALLET AUTO CHECK IN GROUP =================
 @dp.message(lambda m: is_group_message(m) and m.text and extract_tron_address(m.text) is not None)
 async def tron_address_check_handler(m: types.Message):
@@ -2990,6 +3175,8 @@ async def wallet_logs_cb(c: types.CallbackQuery):
 # ================= MANAGE PANEL =================
 @dp.message(lambda m: m.text in ("管理面板", "管理员快捷面板", "续费管理面板", "🛠 管理面板"))
 async def manage_panel_cmd(m: types.Message):
+    if not m.from_user:
+        return
     if not can_use_manage_panel(m.from_user.id):
         return await m.reply(deny_text())
 
@@ -2999,12 +3186,15 @@ async def manage_panel_cmd(m: types.Message):
         parse_mode="HTML",
     )
 
+
 @dp.callback_query(lambda c: c.data == "manage:list_admin")
 async def manage_list_admin_cb(c: types.CallbackQuery):
     if not c.from_user or not can_use_manage_panel(c.from_user.id):
         return await c.answer("无权限", show_alert=True)
+    if not c.message:
+        return await c.answer()
 
-    rows = get_all_admins()
+    rows = get_all_admins() or []
     lines = ["📋 <b>管理员列表</b>", ""]
 
     if BOT_OWNER_ID:
@@ -3012,25 +3202,38 @@ async def manage_list_admin_cb(c: types.CallbackQuery):
     if SUPER_ADMIN_ID and SUPER_ADMIN_ID != BOT_OWNER_ID:
         lines.append(f"• <code>{SUPER_ADMIN_ID}</code> — super(env)")
 
-    for uid, role in rows:
+    for item in rows:
+        try:
+            uid, role = item
+        except Exception:
+            continue
         if uid in (BOT_OWNER_ID, SUPER_ADMIN_ID):
             continue
-        lines.append(f"• <code>{uid}</code> — {role}")
+        lines.append(f"• <code>{uid}</code> — {escape(str(role))}")
 
     await c.message.answer("\n".join(lines), parse_mode="HTML")
     await c.answer()
+
 
 @dp.callback_query(lambda c: c.data == "manage:add_admin")
 async def manage_add_admin_cb(c: types.CallbackQuery, state: FSMContext):
     if not c.from_user or not can_manage_admins(c.from_user.id):
         return await c.answer("无权限", show_alert=True)
+    if not c.message:
+        return await c.answer()
 
     await state.set_state(AdminFSM.waiting_add_admin)
-    await c.message.answer("➕ <b>添加管理员</b>\n\n请回复目标用户消息，或直接发送用户ID。", parse_mode="HTML")
+    await c.message.answer(
+        "➕ <b>添加管理员</b>\n\n请回复目标用户消息，或直接发送用户ID。",
+        parse_mode="HTML"
+    )
     await c.answer()
+
 
 @dp.message(AdminFSM.waiting_add_admin)
 async def receive_add_admin(m: types.Message, state: FSMContext):
+    if not m.from_user:
+        return
     if not can_manage_admins(m.from_user.id):
         return await m.reply(deny_text())
 
@@ -3043,21 +3246,41 @@ async def receive_add_admin(m: types.Message, state: FSMContext):
     if not uid:
         return await m.reply("❌ 格式错误，请回复某人消息或发送用户ID。")
 
-    add_admin(uid, "admin")
+    if uid in (BOT_OWNER_ID, SUPER_ADMIN_ID):
+        await state.clear()
+        return await m.reply("⚠️ 该用户已是内置高级管理员。")
+
+    try:
+        add_admin(uid, "admin")
+    except TypeError:
+        add_admin(uid)
+    except Exception as e:
+        print("add_admin error:", e)
+        return await m.reply("❌ 添加管理员失败，请检查数据库函数。")
+
     await state.clear()
     await m.reply(f"✅ 已添加管理员：<code>{uid}</code>", parse_mode="HTML")
+
 
 @dp.callback_query(lambda c: c.data == "manage:del_admin")
 async def manage_del_admin_cb(c: types.CallbackQuery, state: FSMContext):
     if not c.from_user or not can_manage_admins(c.from_user.id):
         return await c.answer("无权限", show_alert=True)
+    if not c.message:
+        return await c.answer()
 
     await state.set_state(AdminFSM.waiting_del_admin)
-    await c.message.answer("➖ <b>删除管理员</b>\n\n请回复目标用户消息，或直接发送用户ID。", parse_mode="HTML")
+    await c.message.answer(
+        "➖ <b>删除管理员</b>\n\n请回复目标用户消息，或直接发送用户ID。",
+        parse_mode="HTML"
+    )
     await c.answer()
+
 
 @dp.message(AdminFSM.waiting_del_admin)
 async def receive_del_admin(m: types.Message, state: FSMContext):
+    if not m.from_user:
+        return
     if not can_manage_admins(m.from_user.id):
         return await m.reply(deny_text())
 
@@ -3070,21 +3293,39 @@ async def receive_del_admin(m: types.Message, state: FSMContext):
     if not uid:
         return await m.reply("❌ 格式错误，请回复某人消息或发送用户ID。")
 
-    remove_admin(uid)
+    if uid in (BOT_OWNER_ID, SUPER_ADMIN_ID):
+        await state.clear()
+        return await m.reply("❌ 不能删除内置高级管理员。")
+
+    try:
+        remove_admin(uid)
+    except Exception as e:
+        print("remove_admin error:", e)
+        return await m.reply("❌ 删除管理员失败，请检查数据库函数。")
+
     await state.clear()
     await m.reply(f"✅ 已删除管理员：<code>{uid}</code>", parse_mode="HTML")
+
 
 @dp.callback_query(lambda c: c.data == "manage:create_code")
 async def manage_create_code_cb(c: types.CallbackQuery, state: FSMContext):
     if not c.from_user or not can_manage_codes(c.from_user.id):
         return await c.answer("无权限", show_alert=True)
+    if not c.message:
+        return await c.answer()
 
     await state.set_state(AdminFSM.waiting_trial_code)
-    await c.message.answer("🔑 <b>创建续费码</b>\n\n请发送新的续费码，例如：<code>ABC123</code>", parse_mode="HTML")
+    await c.message.answer(
+        "🔑 <b>创建续费码</b>\n\n请发送新的续费码，例如：<code>ABC123</code>",
+        parse_mode="HTML"
+    )
     await c.answer()
+
 
 @dp.message(AdminFSM.waiting_trial_code)
 async def receive_manage_trial_code(m: types.Message, state: FSMContext):
+    if not m.from_user:
+        return
     if not can_manage_codes(m.from_user.id):
         return await m.reply(deny_text())
 
@@ -3092,78 +3333,123 @@ async def receive_manage_trial_code(m: types.Message, state: FSMContext):
     if not code:
         return await m.reply("❌ 请输入有效续费码。")
 
-    set_trial_code(code)
+    try:
+        set_trial_code(code)
+    except Exception as e:
+        print("set_trial_code error:", e)
+        return await m.reply("❌ 设置续费码失败。")
+
     await state.clear()
-    await m.reply(f"✅ 已设置续费码：<code>{code}</code>", parse_mode="HTML")
+    await m.reply(f"✅ 已设置续费码：<code>{escape(code)}</code>", parse_mode="HTML")
+
 
 @dp.callback_query(lambda c: c.data == "manage:revoke_code")
 async def manage_revoke_code_cb(c: types.CallbackQuery):
     if not c.from_user or not can_manage_codes(c.from_user.id):
         return await c.answer("无权限", show_alert=True)
+    if not c.message:
+        return await c.answer()
 
-    set_trial_code("")
+    try:
+        set_trial_code("")
+    except Exception as e:
+        print("revoke trial code error:", e)
+        return await c.answer("操作失败", show_alert=True)
+
     await c.message.answer("🗑 <b>续费码已回收</b>", parse_mode="HTML")
     await c.answer()
+
 
 # ================= RENT MENU =================
 @dp.message(lambda m: m.text in ("🔑 自助续费", "自助续费", "续费/租用"))
 async def menu_rent(m: types.Message):
-    await m.answer("🔑 <b>请选择要租用的机器人类型</b>", reply_markup=rent_main_kb(), parse_mode="HTML")
+    await m.answer(
+        "🔑 <b>请选择要租用的机器人类型</b>",
+        reply_markup=rent_main_kb(),
+        parse_mode="HTML"
+    )
+
 
 @dp.callback_query(lambda c: c.data == "rent:main")
 async def rent_main_cb(c: types.CallbackQuery):
+    await c.answer()
     if not c.message:
         return
-    await c.message.answer("🔑 <b>请选择要租用的机器人类型</b>", reply_markup=rent_main_kb(), parse_mode="HTML")
-    await c.answer()
+    await c.message.answer(
+        "🔑 <b>请选择要租用的机器人类型</b>",
+        reply_markup=rent_main_kb(),
+        parse_mode="HTML"
+    )
+
 
 @dp.callback_query(lambda c: c.data == "rent:back")
 async def rent_back_cb(c: types.CallbackQuery):
+    await c.answer()
     if not c.message:
         return
-    await c.message.answer("🔑 <b>请选择要租用的机器人类型</b>", reply_markup=rent_main_kb(), parse_mode="HTML")
-    await c.answer()
+    await c.message.answer(
+        "🔑 <b>请选择要租用的机器人类型</b>",
+        reply_markup=rent_main_kb(),
+        parse_mode="HTML"
+    )
+
 
 @dp.callback_query(lambda c: c.data in ("rent:group_admin", "rent:computer", "rent:translator"))
 async def rent_category_cb(c: types.CallbackQuery):
-    if not c.message:
+    await c.answer()
+    if not c.message or not c.data:
         return
+
     category_key = c.data.split(":")[1]
     title = RENT_CATEGORIES.get(category_key, {}).get("title", "套餐")
-    await c.message.answer(f"📦 <b>{title}</b>\n\n请选择租用时长：", reply_markup=rent_plan_kb(category_key), parse_mode="HTML")
-    await c.answer()
+    await c.message.answer(
+        f"📦 <b>{escape(title)}</b>\n\n请选择租用时长：",
+        reply_markup=rent_plan_kb(category_key),
+        parse_mode="HTML"
+    )
+
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("rent:plan:"))
 async def rent_plan_cb(c: types.CallbackQuery):
-    if not c.message or not c.from_user:
+    if not c.message or not c.from_user or not c.data:
         return
 
-    _, _, category_key, plan_key = c.data.split(":", 3)
+    await c.answer("✅ 已生成订单")
+
+    try:
+        _, _, category_key, plan_key = c.data.split(":", 3)
+    except Exception:
+        return await c.message.answer("❌ 套餐参数错误")
+
     cat = RENT_CATEGORIES.get(category_key)
     plan = RENT_PLANS.get(plan_key)
 
     if not cat or not plan:
-        return await c.answer("套餐不存在", show_alert=True)
+        return await c.message.answer("❌ 套餐不存在")
 
     category_title = cat["title"]
     plan_label = plan["label"]
     amount = plan["amount"]
 
-    order_code = create_rental_order(
-        user_id=c.from_user.id,
-        username=c.from_user.username or "",
-        full_name=c.from_user.full_name or "",
-        category_key=category_key,
-        category_title=category_title,
-        plan_key=plan_key,
-        plan_label=plan_label,
-        amount=amount,
-        note="rent_order",
-    )
+    try:
+        order_code = create_rental_order(
+            user_id=c.from_user.id,
+            username=c.from_user.username or "",
+            full_name=c.from_user.full_name or "",
+            category_key=category_key,
+            category_title=category_title,
+            plan_key=plan_key,
+            plan_label=plan_label,
+            amount=amount,
+            note="rent_order",
+        )
+    except Exception as e:
+        print("create_rental_order error:", e)
+        return await c.message.answer("❌ 创建订单失败，请检查数据库函数。")
 
     text = rent_payment_text(category_key, plan_key, order_code)
     await c.message.answer(text, reply_markup=rent_payment_kb(amount), parse_mode="HTML")
-    await c.answer("✅ 已生成订单")
+
 
 # ================= ORDER MANAGEMENT =================
 @dp.callback_query(lambda c: c.data == "order:list_pending")
@@ -3174,13 +3460,18 @@ async def order_list_pending_cb(c: types.CallbackQuery):
     if not can_use_manage_panel(c.from_user.id):
         return await c.answer("无权限", show_alert=True)
 
-    rows = get_pending_rental_orders(limit=10)
+    rows = get_pending_rental_orders(limit=10) or []
     if not rows:
         await c.message.answer("暂无待支付订单")
         return await c.answer()
 
     buttons = []
-    for order_code, user_id, username, full_name, category_title, plan_label, amount, created_at in rows:
+    for row in rows:
+        try:
+            order_code, user_id, username, full_name, category_title, plan_label, amount, created_at = row
+        except Exception:
+            continue
+
         buttons.append([
             InlineKeyboardButton(
                 text=f"🧾 {order_code} | {plan_label} | {amount}U",
@@ -3188,8 +3479,13 @@ async def order_list_pending_cb(c: types.CallbackQuery):
             )
         ])
 
-    await c.message.answer("🧾 <b>待支付订单</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    await c.message.answer(
+        "🧾 <b>待支付订单</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
     await c.answer()
+
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("order:view:"))
 async def view_order_cb(c: types.CallbackQuery):
@@ -3204,10 +3500,13 @@ async def view_order_cb(c: types.CallbackQuery):
     if not row:
         return await c.answer("订单不存在", show_alert=True)
 
-    (
-        order_code, user_id, username, full_name, category_key, category_title,
-        plan_key, plan_label, amount, status, created_at, paid_at, expires_at, note
-    ) = row
+    try:
+        (
+            order_code, user_id, username, full_name, category_key, category_title,
+            plan_key, plan_label, amount, status, created_at, paid_at, expires_at, note
+        ) = row
+    except Exception:
+        return await c.answer("订单数据异常", show_alert=True)
 
     created_str = datetime.fromtimestamp(created_at, BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
     paid_str = "-" if not paid_at else datetime.fromtimestamp(paid_at, BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -3216,12 +3515,12 @@ async def view_order_cb(c: types.CallbackQuery):
     text = (
         f"🧾 <b>订单详情</b>\n\n"
         f"订单号：<code>{order_code}</code>\n"
-        f"用户：<code>{user_id}</code> @{username or '-'}\n"
-        f"姓名：{full_name or '-'}\n"
-        f"类型：{category_title}\n"
-        f"套餐：{plan_label}\n"
+        f"用户：<code>{user_id}</code> @{escape(username or '-')}\n"
+        f"姓名：{escape(full_name or '-')}\n"
+        f"类型：{escape(category_title)}\n"
+        f"套餐：{escape(plan_label)}\n"
         f"金额：<b>{amount} U</b>\n"
-        f"状态：<b>{status}</b>\n"
+        f"状态：<b>{escape(str(status))}</b>\n"
         f"创建时间：{created_str}\n"
         f"支付时间：{paid_str}\n"
         f"到期时间：{expire_str}\n"
@@ -3238,6 +3537,7 @@ async def view_order_cb(c: types.CallbackQuery):
     await c.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
     await c.answer()
 
+
 @dp.callback_query(lambda c: c.data and c.data.startswith("order:approve:"))
 async def order_approve_cb(c: types.CallbackQuery):
     if not c.message or not c.from_user:
@@ -3251,10 +3551,13 @@ async def order_approve_cb(c: types.CallbackQuery):
     if not row:
         return await c.answer("订单不存在", show_alert=True)
 
-    (
-        order_code, user_id, username, full_name, category_key, category_title,
-        plan_key, plan_label, amount, status, created_at, paid_at, expires_at, note
-    ) = row
+    try:
+        (
+            order_code, user_id, username, full_name, category_key, category_title,
+            plan_key, plan_label, amount, status, created_at, paid_at, expires_at, note
+        ) = row
+    except Exception:
+        return await c.answer("订单数据异常", show_alert=True)
 
     if status == "paid":
         return await c.answer("订单已支付", show_alert=True)
@@ -3267,12 +3570,12 @@ async def order_approve_cb(c: types.CallbackQuery):
 
     try:
         await bot.send_message(
-            user_id,
-            (
+            chat_id=user_id,
+            text=(
                 "✅ <b>续费/租用成功</b>\n\n"
                 f"订单号：<code>{order_code}</code>\n"
-                f"类型：{category_title}\n"
-                f"套餐：{plan_label}\n"
+                f"类型：{escape(category_title)}\n"
+                f"套餐：{escape(plan_label)}\n"
                 f"到期时间：<b>{expire_str}</b>\n\n"
                 "权限已自动开通/续期。"
             ),
@@ -3293,6 +3596,7 @@ async def order_approve_cb(c: types.CallbackQuery):
     )
     await c.answer("✅ 已开通/续期")
 
+
 @dp.callback_query(lambda c: c.data and c.data.startswith("order:reject:"))
 async def order_reject_cb(c: types.CallbackQuery):
     if not c.message or not c.from_user:
@@ -3306,22 +3610,29 @@ async def order_reject_cb(c: types.CallbackQuery):
     if not row:
         return await c.answer("订单不存在", show_alert=True)
 
-    (
-        order_code, user_id, username, full_name, category_key, category_title,
-        plan_key, plan_label, amount, status, created_at, paid_at, expires_at, note
-    ) = row
+    try:
+        (
+            order_code, user_id, username, full_name, category_key, category_title,
+            plan_key, plan_label, amount, status, created_at, paid_at, expires_at, note
+        ) = row
+    except Exception:
+        return await c.answer("订单数据异常", show_alert=True)
 
     if status == "paid":
         return await c.answer("订单已支付", show_alert=True)
 
-    mark_rental_order_rejected(order_code)
+    try:
+        mark_rental_order_rejected(order_code)
+    except Exception as e:
+        print("mark_rental_order_rejected error:", e)
+        return await c.answer("操作失败", show_alert=True)
 
     await c.message.answer(
         (
             f"❌ <b>订单已拒绝</b>\n\n"
             f"订单号：<code>{order_code}</code>\n"
             f"用户：<code>{user_id}</code>\n"
-            f"套餐：{plan_label}\n"
+            f"套餐：{escape(plan_label)}\n"
             f"金额：<b>{amount} U</b>\n"
             f"状态：<b>rejected</b>"
         ),
@@ -3330,11 +3641,11 @@ async def order_reject_cb(c: types.CallbackQuery):
 
     try:
         await bot.send_message(
-            user_id,
-            (
+            chat_id=user_id,
+            text=(
                 "❌ <b>您的订单未通过</b>\n\n"
                 f"订单号：<code>{order_code}</code>\n"
-                f"套餐：{plan_label}\n"
+                f"套餐：<code>{escape(plan_label)}</code>\n"
                 "如有疑问，请联系管理员。"
             ),
             parse_mode="HTML",
@@ -3344,11 +3655,19 @@ async def order_reject_cb(c: types.CallbackQuery):
 
     await c.answer("✅ 已拒绝")
 
+
 @dp.message(lambda m: m.text in ("订单历史", "租用历史", "历史订单"))
 async def order_history_cmd(m: types.Message):
+    if not m.from_user:
+        return
     if not can_use_manage_panel(m.from_user.id):
         return await m.reply("❌ 无权限")
-    await m.reply("🧾 <b>订单历史</b>\n\n请选择查看类型：", reply_markup=order_history_kb(), parse_mode="HTML")
+    await m.reply(
+        "🧾 <b>订单历史</b>\n\n请选择查看类型：",
+        reply_markup=order_history_kb(),
+        parse_mode="HTML"
+    )
+
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("order:history:"))
 async def order_history_cb(c: types.CallbackQuery):
@@ -3360,11 +3679,11 @@ async def order_history_cb(c: types.CallbackQuery):
 
     status = c.data.split(":")[2]
     if status == "all":
-        rows = get_rental_orders_by_status(None, limit=20)
+        rows = get_rental_orders_by_status(None, limit=20) or []
         title = "📦 全部订单"
     else:
-        rows = get_rental_orders_by_status(status, limit=20)
-        title = f"📦 {status}"
+        rows = get_rental_orders_by_status(status, limit=20) or []
+        title = f"📦 {escape(status)}"
 
     if not rows:
         await c.message.answer(f"{title}\n\n暂无记录")
@@ -3372,15 +3691,19 @@ async def order_history_cb(c: types.CallbackQuery):
 
     text = f"{title}\n\n"
     for row in rows:
-        order_code, user_id, username, full_name, category_title, plan_label, amount, st, created_at, paid_at, expires_at = row
+        try:
+            order_code, user_id, username, full_name, category_title, plan_label, amount, st, created_at, paid_at, expires_at = row
+        except Exception:
+            continue
+
         created_str = datetime.fromtimestamp(created_at, BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
         paid_str = "-" if not paid_at else datetime.fromtimestamp(paid_at, BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
         expire_str = "-" if not expires_at else datetime.fromtimestamp(expires_at, BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
         text += (
             f"• <code>{order_code}</code>\n"
-            f"  {category_title} | {plan_label} | {amount}U | {st}\n"
-            f"  用户：<code>{user_id}</code> @{username or '-'}\n"
+            f"  {escape(category_title)} | {escape(plan_label)} | {amount}U | {escape(str(st))}\n"
+            f"  用户：<code>{user_id}</code> @{escape(username or '-')}\n"
             f"  创建：{created_str}\n"
             f"  支付：{paid_str}\n"
             f"  到期：{expire_str}\n\n"
@@ -3389,9 +3712,13 @@ async def order_history_cb(c: types.CallbackQuery):
     await send_long_text(c.message.chat.id, text, parse_mode="HTML")
     await c.answer()
 
+
 # ================= BROADCAST =================
 @dp.message(lambda m: m.text in ("📣 群发广播", "群发广播"))
 async def menu_broadcast(m: types.Message, state: FSMContext):
+    if not m.from_user:
+        return
+
     if is_private(m):
         if get_user_role(m.from_user.id) not in ("owner", "super"):
             return await m.answer("❌ 只有超级管理员可在私聊里全局群发。")
@@ -3407,6 +3734,7 @@ async def menu_broadcast(m: types.Message, state: FSMContext):
     await state.set_state(BroadcastFSM.waiting_content)
     await state.update_data(scope=scope, target_chat_id=target_chat_id, creator_id=m.from_user.id)
     await m.reply("📢 请发送要广播的内容。")
+
 
 @dp.message(BroadcastFSM.waiting_content)
 async def broadcast_receive_content(m: types.Message, state: FSMContext):
@@ -3437,6 +3765,7 @@ async def broadcast_receive_content(m: types.Message, state: FSMContext):
     await m.reply("请确认广播方式：", reply_markup=kb)
     await state.set_state(BroadcastFSM.waiting_confirm)
 
+
 @dp.callback_query(lambda c: c.data and c.data.startswith("bc:"))
 async def broadcast_callback(c: types.CallbackQuery, state: FSMContext):
     if not c.from_user:
@@ -3462,7 +3791,7 @@ async def broadcast_callback(c: types.CallbackQuery, state: FSMContext):
         return await c.answer()
 
     if scope == "all":
-        targets = [g[0] for g in get_groups()]
+        targets = [g[0] for g in (get_groups() or [])]
     else:
         target_chat_id = data.get("target_chat_id")
         targets = [target_chat_id] if target_chat_id is not None else []
@@ -3475,12 +3804,21 @@ async def broadcast_callback(c: types.CallbackQuery, state: FSMContext):
 
     ok = 0
     fail = 0
+
     for chat_id in targets:
         try:
             if c.data == "bc:copy":
-                await bot.copy_message(chat_id=chat_id, from_chat_id=source_chat_id, message_id=source_message_id)
+                await bot.copy_message(
+                    chat_id=chat_id,
+                    from_chat_id=source_chat_id,
+                    message_id=source_message_id
+                )
             else:
-                await bot.forward_message(chat_id=chat_id, from_chat_id=source_chat_id, message_id=source_message_id)
+                await bot.forward_message(
+                    chat_id=chat_id,
+                    from_chat_id=source_chat_id,
+                    message_id=source_message_id
+                )
             ok += 1
         except Exception as e:
             fail += 1
@@ -3494,6 +3832,8 @@ async def broadcast_callback(c: types.CallbackQuery, state: FSMContext):
 # ================= TRANSACTION HISTORY WEB =================
 @dp.message(lambda m: m.text in ("交易历史", "📜 交易历史"))
 async def menu_history(m: types.Message):
+    if not m.from_user:
+        return
     if not can_use_bot_ops(m.from_user.id):
         return await m.reply(deny_text())
 
@@ -3502,6 +3842,7 @@ async def menu_history(m: types.Message):
         reply_markup=history_groups_kb(),
         parse_mode="HTML",
     )
+
 
 @dp.callback_query(lambda c: c.data == "report:full")
 async def report_full_cb(c: types.CallbackQuery):
@@ -3516,8 +3857,10 @@ async def report_full_cb(c: types.CallbackQuery):
     await c.message.reply(
         report_text(c.message.chat.id, start_ts, end_ts, title="今日账单"),
         reply_markup=report_kb(c.message.chat.id),
+        parse_mode="HTML",
     )
     await c.answer()
+
 
 # ================= LEDGER HANDLER =================
 @dp.message()
@@ -3529,6 +3872,8 @@ async def ledger_handler(m: types.Message):
     if not m.text:
         return
     if m.text.startswith("/"):
+        return
+    if not m.from_user:
         return
 
     ensure_group(m)
@@ -3673,6 +4018,7 @@ async def ledger_handler(m: types.Message):
         reply_markup=report_kb(m.chat.id),
     )
 
+
 # ================= USER / BOT JOIN =================
 @dp.message(lambda m: bool(m.new_chat_members))
 async def new_members(m: types.Message):
@@ -3688,6 +4034,7 @@ async def new_members(m: types.Message):
     except Exception as e:
         print("new_members error:", e)
 
+
 @dp.my_chat_member()
 async def on_bot_member_update(e: types.ChatMemberUpdated):
     try:
@@ -3696,6 +4043,7 @@ async def on_bot_member_update(e: types.ChatMemberUpdated):
             await bot.send_message(e.chat.id, "✅ 记账机器人已加入本群。")
     except Exception as ex:
         print("on_bot_member_update error:", ex)
+
 
 # ================= WEBHOOK / HEALTH =================
 @app.post("/webhook")
@@ -3708,26 +4056,30 @@ async def webhook(req: Request):
 
     try:
         data = await req.json()
-        update = types.Update.model_validate(data)
+        update = Update.model_validate(data)
         await dp.feed_update(bot, update)
-        return {"ok": True}
+        return JSONResponse({"ok": True})
     except Exception as e:
         print("webhook error:", e)
         traceback.print_exc()
-        return {"ok": False, "error": str(e)}
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
+
 
 # ================= WEB AUTH HELPERS =================
 def get_web_admin_name():
     return WEB_ADMIN_NAME or "BOT 888"
 
+
 def is_web_logged_in(request: Request):
     session = request.cookies.get("god_session", "")
     return session == WEB_TOKEN
+
 
 def guard(request: Request):
     if not is_web_logged_in(request):
         return RedirectResponse(url="/login", status_code=302)
     return None
+
 
 def simple_page(title: str, subtitle: str, body: str = ""):
     return f"""
@@ -3898,6 +4250,7 @@ pre {{
 </html>
 """
 
+
 # ================= DASHBOARD DATA =================
 def dashboard_stats():
     try:
@@ -3982,6 +4335,7 @@ def dashboard_stats():
             "wallet_users": 0,
         }
 
+
 def dashboard_chart():
     try:
         labels = []
@@ -4004,7 +4358,8 @@ def dashboard_chart():
                     (int(start.timestamp()), int(end.timestamp()))
                 )
 
-                amount = cur.fetchone()[0] or 0
+                row = cur.fetchone() or (0,)
+                amount = row[0] or 0
                 labels.append(d.strftime("%m-%d"))
                 values.append(float(amount))
 
@@ -4676,55 +5031,59 @@ body {{
 </div>
 
 <script>
-const labels = {json.dumps(labels, ensure_ascii=False)};
-const values = {json.dumps(values)};
+const labels = {json.dumps(labels or [], ensure_ascii=False)};
+const values = {json.dumps(values or [])};
 
-const ctx = document.getElementById('myChart').getContext('2d');
-const gradient = ctx.createLinearGradient(0, 0, 0, 320);
-gradient.addColorStop(0, 'rgba(58,184,255,0.38)');
-gradient.addColorStop(1, 'rgba(58,184,255,0.02)');
+const canvas = document.getElementById('myChart');
+if (canvas && window.Chart) {{
+    const ctx = canvas.getContext('2d');
+    const gradient = ctx.createLinearGradient(0, 0, 0, 320);
+    gradient.addColorStop(0, 'rgba(58,184,255,0.38)');
+    gradient.addColorStop(1, 'rgba(58,184,255,0.02)');
 
-new Chart(ctx, {{
-    type: 'line',
-    data: {{
-        labels: labels,
-        datasets: [{{
-            label: '7 Day Volume',
-            data: values,
-            borderColor: '#43c6ff',
-            backgroundColor: gradient,
-            fill: true,
-            borderWidth: 3,
-            tension: 0.38
-        }}]
-    }},
-    options: {{
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {{
-            legend: {{
-                labels: {{
-                    color: '#d8e6ff'
+    new Chart(ctx, {{
+        type: 'line',
+        data: {{
+            labels: labels,
+            datasets: [{{
+                label: '7 Day Volume',
+                data: values,
+                borderColor: '#43c6ff',
+                backgroundColor: gradient,
+                fill: true,
+                borderWidth: 3,
+                tension: 0.38
+            }}]
+        }},
+        options: {{
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {{
+                legend: {{
+                    labels: {{
+                        color: '#d8e6ff'
+                    }}
+                }}
+            }},
+            scales: {{
+                x: {{
+                    ticks: {{ color: '#9fb3d1' }},
+                    grid: {{ color: 'rgba(255,255,255,0.05)' }}
+                }},
+                y: {{
+                    ticks: {{ color: '#9fb3d1' }},
+                    grid: {{ color: 'rgba(255,255,255,0.05)' }}
                 }}
             }}
-        }},
-        scales: {{
-            x: {{
-                ticks: {{ color: '#9fb3d1' }},
-                grid: {{ color: 'rgba(255,255,255,0.05)' }}
-            }},
-            y: {{
-                ticks: {{ color: '#9fb3d1' }},
-                grid: {{ color: 'rgba(255,255,255,0.05)' }}
-            }}
         }}
-    }}
-}});
+    }});
+}}
 setTimeout(() => location.reload(), 20000);
 </script>
 </body>
 </html>
 """
+
 
 # ================= WEB PAGES =================
 @app.get("/bots", response_class=HTMLResponse)
@@ -4757,13 +5116,14 @@ async def bots_page(request: Request):
     """
     return HTMLResponse(simple_page("🤖 Bot Management", "Quản lý bot đang hoạt động", body))
 
+
 @app.get("/admins", response_class=HTMLResponse)
 async def admins_page(request: Request):
     auth = guard(request)
     if auth:
         return auth
 
-    rows = get_all_admins()
+    rows = get_all_admins() or []
     html_rows = []
 
     if BOT_OWNER_ID:
@@ -4771,11 +5131,15 @@ async def admins_page(request: Request):
     if SUPER_ADMIN_ID and SUPER_ADMIN_ID != BOT_OWNER_ID:
         html_rows.append(f"<tr><td>{SUPER_ADMIN_ID}</td><td>super(env)</td><td><span class='badge'>ACTIVE</span></td></tr>")
 
-    for uid, role in rows:
+    for item in rows:
+        try:
+            uid, role = item
+        except Exception:
+            continue
         if uid in (BOT_OWNER_ID, SUPER_ADMIN_ID):
             continue
         html_rows.append(
-            f"<tr><td>{uid}</td><td>{escape(role)}</td><td><span class='badge'>ACTIVE</span></td></tr>"
+            f"<tr><td>{uid}</td><td>{escape(str(role))}</td><td><span class='badge'>ACTIVE</span></td></tr>"
         )
 
     body = f"""
@@ -4788,16 +5152,21 @@ async def admins_page(request: Request):
     """
     return HTMLResponse(simple_page("🛡 Admin Management", "Quản lý admin web", body))
 
+
 @app.get("/orders", response_class=HTMLResponse)
 async def orders_page(request: Request):
     auth = guard(request)
     if auth:
         return auth
 
-    rows = get_rental_orders_by_status(None, limit=100)
+    rows = get_rental_orders_by_status(None, limit=100) or []
     trs = []
     for row in rows:
-        order_code, user_id, username, full_name, category_title, plan_label, amount, st, created_at, paid_at, expires_at = row
+        try:
+            order_code, user_id, username, full_name, category_title, plan_label, amount, st, created_at, paid_at, expires_at = row
+        except Exception:
+            continue
+
         badge_cls = "badge"
         if st == "rejected":
             badge_cls = "badge red"
@@ -4806,13 +5175,13 @@ async def orders_page(request: Request):
 
         trs.append(
             f"<tr>"
-            f"<td>{escape(order_code)}</td>"
+            f"<td>{escape(str(order_code))}</td>"
             f"<td>{user_id}</td>"
             f"<td>@{escape(username or '-')}</td>"
             f"<td>{escape(category_title or '-')}</td>"
             f"<td>{escape(plan_label or '-')}</td>"
             f"<td>{fmt_num(amount)}U</td>"
-            f"<td><span class='{badge_cls}'>{escape(st)}</span></td>"
+            f"<td><span class='{badge_cls}'>{escape(str(st))}</span></td>"
             f"<td>{fmt_ts(created_at)}</td>"
             f"</tr>"
         )
@@ -4838,6 +5207,7 @@ async def orders_page(request: Request):
     """
     return HTMLResponse(simple_page("📦 Orders", "Quản lý đơn hàng / gia hạn", body))
 
+
 @app.get("/users", response_class=HTMLResponse)
 async def users_page(request: Request, page: int = 1, keyword: str = "", status: str = ""):
     auth = guard(request)
@@ -4846,12 +5216,17 @@ async def users_page(request: Request, page: int = 1, keyword: str = "", status:
 
     limit = 20
     offset = (max(page, 1) - 1) * limit
-    rows = get_access_users_page(limit=limit, offset=offset, keyword=keyword or None, status=status or None)
+    rows = get_access_users_page(limit=limit, offset=offset, keyword=keyword or None, status=status or None) or []
     total = count_access_users_filtered(keyword=keyword or None, status=status or None)
     total_pages = max(1, (total + limit - 1) // limit)
 
     trs = []
-    for user_id, username, granted_by, granted_at, expires_at in rows:
+    for row in rows:
+        try:
+            user_id, username, granted_by, granted_at, expires_at = row
+        except Exception:
+            continue
+
         role = "VIP"
         exp = "Permanent" if expires_at is None else fmt_ts(expires_at)
         trs.append(
@@ -4893,6 +5268,7 @@ async def users_page(request: Request, page: int = 1, keyword: str = "", status:
     """
     return HTMLResponse(simple_page("👑 Users", "Quản lý user VIP", body))
 
+
 @app.get("/transactions", response_class=HTMLResponse)
 async def transactions_page(request: Request, date: str | None = None):
     auth = guard(request)
@@ -4925,10 +5301,14 @@ async def transactions_page(request: Request, date: str | None = None):
             ''',
             (start_ts, end_ts)
         )
-        rows = cur.fetchall()
+        rows = cur.fetchall() or []
 
     for tx in rows:
-        tx_id, chat_id, user_id, username, display_name, target_name, kind, raw_amount, unit_amount, rate_used, fee_used, note, original_text, created_at, undone = tx
+        try:
+            tx_id, chat_id, user_id, username, display_name, target_name, kind, raw_amount, unit_amount, rate_used, fee_used, note, original_text, created_at, undone = tx
+        except Exception:
+            continue
+
         trs.append(
             f"<tr>"
             f"<td>{fmt_ts(created_at)}</td>"
@@ -4963,15 +5343,21 @@ async def transactions_page(request: Request, date: str | None = None):
     """
     return HTMLResponse(simple_page("💸 Transaction History", "Lịch sử giao dịch toàn hệ thống", body))
 
+
 @app.get("/groups", response_class=HTMLResponse)
 async def groups_page(request: Request):
     auth = guard(request)
     if auth:
         return auth
 
-    rows = get_groups()
+    rows = get_groups() or []
     trs = []
-    for chat_id, title in rows:
+    for item in rows:
+        try:
+            chat_id, title = item
+        except Exception:
+            continue
+
         trs.append(
             f"<tr>"
             f"<td>{escape(title or '-')}</td>"
@@ -4991,6 +5377,7 @@ async def groups_page(request: Request):
     """
     return HTMLResponse(simple_page("👥 Group Management", "Quản lý nhóm Telegram", body))
 
+
 @app.get("/group/{chat_id}", response_class=HTMLResponse)
 async def group_history_page(chat_id: int, request: Request, date: str | None = None):
     auth = guard(request)
@@ -5007,12 +5394,16 @@ async def group_history_page(chat_id: int, request: Request, date: str | None = 
     except Exception:
         start_ts, end_ts = day_range()
 
-    txs = get_transactions(chat_id, start_ts=start_ts, end_ts=end_ts)
+    txs = get_transactions(chat_id, start_ts=start_ts, end_ts=end_ts) or []
     stats = summarize_transactions(txs)
 
     trs = []
     for tx in txs:
-        tx_id, chat_id, user_id, username, display_name, target_name, kind, raw_amount, unit_amount, rate_used, fee_used, note, original_text, created_at, undone = tx
+        try:
+            tx_id, chat_id, user_id, username, display_name, target_name, kind, raw_amount, unit_amount, rate_used, fee_used, note, original_text, created_at, undone = tx
+        except Exception:
+            continue
+
         trs.append(
             f"<tr>"
             f"<td>{fmt_ts(created_at)}</td>"
@@ -5060,6 +5451,7 @@ async def group_history_page(chat_id: int, request: Request, date: str | None = 
     """
     return HTMLResponse(simple_page(f"📘 Group {chat_id}", "Lịch sử giao dịch nhóm", body))
 
+
 @app.get("/wallet-checks", response_class=HTMLResponse)
 async def wallet_checks_page(request: Request, page: int = 1):
     auth = guard(request)
@@ -5068,13 +5460,17 @@ async def wallet_checks_page(request: Request, page: int = 1):
 
     limit = 30
     offset = (max(page, 1) - 1) * limit
-    rows = get_wallet_checks_page(limit=limit, offset=offset)
+    rows = get_wallet_checks_page(limit=limit, offset=offset) or []
     total = count_wallet_checks()
     total_pages = max(1, (total + limit - 1) // limit)
 
     trs = []
     for row in rows:
-        _id, chat_id, user_id, username, full_name, address, trx_balance, usdt_balance, tx_count, created_at = row
+        try:
+            _id, chat_id, user_id, username, full_name, address, trx_balance, usdt_balance, tx_count, created_at = row
+        except Exception:
+            continue
+
         sender = full_name or username or str(user_id)
         trs.append(
             f"<tr>"
@@ -5121,6 +5517,7 @@ async def wallet_checks_page(request: Request, page: int = 1):
     """
     return HTMLResponse(simple_page("🔎 Wallet Check Logs", "Tất cả log user gửi ví", body))
 
+
 @app.get("/wallet-summary", response_class=HTMLResponse)
 async def wallet_summary_page(request: Request):
     auth = guard(request)
@@ -5158,7 +5555,7 @@ async def wallet_summary_page(request: Request):
                 LIMIT 50
                 '''
             )
-            user_rows = cur.fetchall()
+            user_rows = cur.fetchall() or []
 
             cur.execute(
                 '''
@@ -5173,13 +5570,18 @@ async def wallet_summary_page(request: Request):
                 LIMIT 50
                 '''
             )
-            group_rows = cur.fetchall()
+            group_rows = cur.fetchall() or []
 
     except Exception as e:
         print("wallet_summary_page error:", e)
 
     user_trs = []
-    for user_id, sender, username, total_times, last_time in user_rows:
+    for row in user_rows:
+        try:
+            user_id, sender, username, total_times, last_time = row
+        except Exception:
+            continue
+
         user_trs.append(
             f"<tr>"
             f"<td>{user_id}</td>"
@@ -5191,7 +5593,12 @@ async def wallet_summary_page(request: Request):
         )
 
     group_trs = []
-    for chat_id, total_times, d_users, last_time in group_rows:
+    for row in group_rows:
+        try:
+            chat_id, total_times, d_users, last_time = row
+        except Exception:
+            continue
+
         group_trs.append(
             f"<tr>"
             f"<td>{chat_id}</td>"
@@ -5229,6 +5636,7 @@ async def wallet_summary_page(request: Request):
     """
     return HTMLResponse(simple_page("📊 Wallet Summary", "Thống kê user gửi ví và theo nhóm", body))
 
+
 # ================= HEALTH =================
 @app.get("/healthz")
 async def healthz():
@@ -5238,6 +5646,7 @@ async def healthz():
         "time": datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S"),
     }
 
+
 # ================= RUN =================
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=False)
