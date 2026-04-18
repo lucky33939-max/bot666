@@ -273,8 +273,22 @@ def init_db():
         cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_rental_orders_user_created
         ON rental_orders(user_id, created_at DESC)
+        """)       
+
+        cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_expiry_notices_user_notice
+        ON expiry_notices(user_id, notice_key)
         """)
 
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_access_users_granted_at
+        ON access_users(granted_at DESC)
+        """)
+
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_wallet_checks_user_created
+        ON wallet_checks(user_id, created_at DESC)
+        """)
 
 # ================= ADMIN =================
 def add_admin(user_id, role="admin"):
